@@ -1,0 +1,93 @@
+name: revert-promotion
+
+# The actual work behind revert-promotion.yml — see
+# provision-workspace.yml's header for why this split exists and
+# how `secrets`/`vars` resolve.  [P5.4]
+#
+# Revert a workspace's promotion — opens a PR on `dev` containing the exact
+# inverse of the promotion's squash commit.  [P4.1]
+#
+# RUNS A REAL `git revert`, rather than reconstructing one via the REST API.
+# A hand-rolled tree splice (base_tree + override the changed paths) cannot
+# detect a conflict with a later, unrelated change to the same file — it
+# would silently overwrite it. `git revert` performs the three-way merge
+# and fails loudly instead, which is what a safety-net feature has to do.
+#
+# USES WS_AUTOMERGE_TOKEN, not the default GITHUB_TOKEN, for the push and the
+# PR: a GITHUB_TOKEN-authored push/PR does not trigger `ci.yml`'s
+# `pull_request` jobs, and this PR needs `verify`/`protected-paths`/
+# `destructive-ddl` to run on it like any other change landing on `dev`. Same
+# reasoning ws-automerge.yml documents for that token, and the same token —
+# its five permissions (Metadata read, Pull requests write, Contents write,
+# Actions write, Issues write) already cover both operations this workflow
+# performs. See MANUAL_STEPS.md.
+
+on:
+  workflow_call:
+    inputs:
+      slug:
+        description: 8-char workspace slug (for the revert branch's name)
+        required: true
+        type: string
+      mergeCommitSha:
+        description: The squash commit on dev to revert
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: revert-promotion-${{ inputs.slug }}-${{ inputs.mergeCommitSha }}
+  cancel-in-progress: false
+
+jobs:
+  revert:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      SLUG: ${{ inputs.slug }}
+      SHA: ${{ inputs.mergeCommitSha }}
+      GH_TOKEN: ${{ secrets.WS_AUTOMERGE_TOKEN }}
+      REPO: ${{ github.repository }}
+    steps:
+      - name: Validate inputs
+        run: |
+          set -euo pipefail
+          echo "$SLUG" | grep -Eq '^[0-9a-z]{8}$' || { echo "::error::bad slug: $SLUG"; exit 1; }
+          echo "$SHA" | grep -Eiq '^[0-9a-f]{40}$' || { echo "::error::bad commit sha: $SHA"; exit 1; }
+
+      - uses: actions/checkout@v6
+        with:
+          ref: dev
+          fetch-depth: 0
+          token: ${{ secrets.WS_AUTOMERGE_TOKEN }}
+
+      - name: Revert the promotion commit
+        run: |
+          set -euo pipefail
+          git config user.name "workspace-revert"
+          git config user.email "revert@users.noreply.github.com"
+
+          SHORT="${SHA:0:8}"
+          BRANCH="revert/${SLUG}-${SHORT}"
+          git checkout -b "$BRANCH"
+
+          if ! git revert --no-edit "$SHA"; then
+            git revert --abort
+            echo "::error::git revert hit a conflict on $SHA — a later commit on dev touches the same lines. This needs a human to resolve by hand; it is not something to retry."
+            exit 1
+          fi
+
+          git push origin "$BRANCH"
+          echo "BRANCH=$BRANCH" >> "$GITHUB_ENV"
+          echo "SHORT=$SHORT" >> "$GITHUB_ENV"
+
+      - name: Open the revert PR
+        run: |
+          set -euo pipefail
+          gh pr create --repo "$REPO" --base dev --head "$BRANCH" \
+            --title "Revert workspace ${SLUG}'s promotion (${SHORT})" \
+            --body "Reverts \`${SHA}\`, the squash commit that promoted workspace \`${SLUG}\`.
+
+          Opened by the Revert action on that workspace — review and merge like any other PR. [P4.1]"

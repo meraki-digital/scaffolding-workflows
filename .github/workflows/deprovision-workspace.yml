@@ -1,0 +1,139 @@
+name: deprovision-workspace
+
+# The actual work behind deprovision-workspace.yml — see
+# provision-workspace.yml's header for why this split exists and
+# how `secrets`/`vars` resolve.  [P5.4]
+#
+# Repo config this still needs (see MANUAL_STEPS.md): secrets
+# DATABASE_URL_RDS_ADMIN, PROVISION_CALLBACK_SECRET; vars
+# WS_PROVISIONER_ROLE_ARN, CDK_DEFAULT_ACCOUNT, AWS_REGION, APP_NAME.
+
+on:
+  workflow_call:
+    inputs:
+      workspaceId:
+        description: Control-plane workspace id (uuid)
+        required: true
+        type: string
+      slug:
+        description: 8-char workspace slug
+        required: true
+        type: string
+      callbackBaseUrl:
+        description: Base URL of the dispatching backend (for callbacks)
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  id-token: write
+
+concurrency:
+  group: deprovision-workspace-${{ inputs.slug }}
+  cancel-in-progress: false
+
+env:
+  APP_NAME: ${{ vars.APP_NAME || 'app-starter' }}
+  AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+  CDK_DEFAULT_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+  CDK_DEFAULT_ACCOUNT: ${{ vars.CDK_DEFAULT_ACCOUNT }}
+  SLUG: ${{ inputs.slug }}
+  WORKSPACE_ID: ${{ inputs.workspaceId }}
+  CALLBACK: ${{ inputs.callbackBaseUrl }}
+  WS_DB_NAME: app_ws_${{ inputs.slug }}
+
+jobs:
+  deprovision:
+    runs-on: ubuntu-latest
+    # A ceiling, not a target. Successful teardowns run 0.7-4.1 minutes. The job
+    # had no ceiling, so a stalled step could have run for six hours — and an
+    # abandoned teardown leaves the stack, the database and the branch behind,
+    # which is exactly what P0.8 exists to prevent. [P3.13]
+    timeout-minutes: 20
+    steps:
+      - name: Validate slug
+        run: echo "$SLUG" | grep -Eq '^[0-9a-z]{8}$' || { echo "::error::bad slug"; exit 1; }
+
+      - uses: actions/checkout@v6
+        with:
+          ref: dev
+
+      - uses: pnpm/action-setup@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 20
+          cache: pnpm
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Configure AWS credentials (provisioner role)
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          aws-region: ${{ env.AWS_REGION }}
+          role-to-assume: ${{ vars.WS_PROVISIONER_ROLE_ARN }}
+
+      - name: Destroy workspace stack
+        run: |
+          set -euo pipefail
+          # @app/infra imports @meraki-digital/workspace-cdk [P5.3] — build it
+          # first or @app/infra's own build can't resolve the import.
+          pnpm --filter @meraki-digital/workspace-cdk build
+          pnpm --filter @app/infra build
+          pnpm --filter @app/infra exec cdk --app "node dist/app.js" destroy \
+            "$APP_NAME-ws-$SLUG" -c workspace="$SLUG" -c teardown=true --force
+
+      # Its own step, where it used to be the first two lines of the drop below.
+      # A `timeout-minutes` caps a step, not part of one, so client setup had to
+      # come out of the step that uses the admin credential before the cap meant
+      # anything. Normally no network I/O; see scripts/ensure-psql-client.sh for
+      # the 2026-08-19 stall. The script comes from the `dev` checkout above —
+      # dev carries an item before it reaches the branch this definition is
+      # dispatched from. [P3.13]
+      - name: Ensure a PostgreSQL client
+        timeout-minutes: 3
+        run: scripts/ensure-psql-client.sh 16
+
+      - name: Drop the cloned database
+        env:
+          ADMIN_URL: ${{ secrets.DATABASE_URL_RDS_ADMIN }}
+        run: |
+          set -euo pipefail
+          # Terminate stragglers, then drop.
+          psql "$ADMIN_URL" -v ON_ERROR_STOP=1 -c \
+            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname='$WS_DB_NAME' AND pid<>pg_backend_pid();" || true
+          psql "$ADMIN_URL" -v ON_ERROR_STOP=1 -c "DROP DATABASE IF EXISTS \"$WS_DB_NAME\";"
+
+          # The clone's own roles go with it [P0.4(a)]. Roles are cluster-wide, so
+          # without this every workspace ever created leaves one behind. Ordered
+          # after the DROP DATABASE because that is what removes the objects they
+          # own; a role owning anything cannot be dropped.
+          #
+          # Non-fatal on purpose. A leftover role is inert — its database is gone
+          # and it holds CONNECT nowhere else — whereas a teardown that fails here
+          # leaves the stack and the branch behind, which is the failure mode P0.8
+          # exists to prevent.
+          psql "$ADMIN_URL" -c "DROP ROLE IF EXISTS \"ws_$SLUG\";" \
+            || echo "::warning::could not drop role ws_$SLUG; it is inert but left behind"
+          psql "$ADMIN_URL" -c "DROP ROLE IF EXISTS \"ws_${SLUG}_mig\";" \
+            || echo "::warning::could not drop role ws_${SLUG}_mig; it is inert but left behind"
+
+      - name: Delete workspace branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: git push origin --delete "ws/$SLUG" || echo "branch already gone"
+
+      - name: Callback — deprovisioned
+        env:
+          SECRET: ${{ secrets.PROVISION_CALLBACK_SECRET }}
+        run: |
+          curl -fsS -X POST "$CALLBACK/workspaces/$WORKSPACE_ID/deprovisioned" \
+            -H "X-Provision-Secret: $SECRET" -H 'Content-Type: application/json' -d '{}'
+
+      - name: Callback — deprovision failed
+        if: failure()
+        env:
+          SECRET: ${{ secrets.PROVISION_CALLBACK_SECRET }}
+        run: |
+          curl -fsS -X POST "$CALLBACK/workspaces/$WORKSPACE_ID/deprovision-failed" \
+            -H "X-Provision-Secret: $SECRET" -H 'Content-Type: application/json' \
+            -d "{\"error\":\"Teardown failed in GitHub Actions (run ${{ github.run_id }}).\"}" || true

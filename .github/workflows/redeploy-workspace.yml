@@ -1,0 +1,265 @@
+name: redeploy-workspace
+
+# The actual work behind redeploy-workspace.yml — see
+# provision-workspace.yml's header for why this split exists and
+# how `secrets`/`vars` resolve.  [P5.4]
+#
+# Rebuild + redeploy a workspace when its branch gets new commits (e.g. the
+# agent pushes). Resolves the workspace by slug and skips unless it's `active`
+# (provision owns the first build). Reports deploy status back to the dev
+# backend. Unlike provision/deprovision this is dispatched off a push (via
+# ws-automerge), so the callback target is the fixed dev API (vars.DEV_API_URL).
+#
+# Repo config this still needs (see MANUAL_STEPS.md): secrets
+# DATABASE_URL_RDS_ADMIN, CONTROL_DATABASE_URL_RO, PROVISION_CALLBACK_SECRET;
+# vars DEV_API_URL, WS_PROVISIONER_ROLE_ARN, CDK_DEFAULT_ACCOUNT, AWS_REGION,
+# COGNITO_*, REQUEST_ATTACHMENTS_BUCKET, APP_NAME.
+
+on:
+  workflow_call:
+    inputs:
+      slug:
+        description: Workspace slug (8 lowercase alphanumerics, no ws/ prefix)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  id-token: write
+
+# Keyed by slug, not ref_name: dispatched from main, ref_name is "main" for every
+# workspace, so one shared group would let one workspace's deploy cancel another's.
+concurrency:
+  group: redeploy-workspace-${{ inputs.slug }}
+  cancel-in-progress: true
+
+env:
+  APP_NAME: ${{ vars.APP_NAME || 'app-starter' }}
+  AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+  CDK_DEFAULT_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+  CDK_DEFAULT_ACCOUNT: ${{ vars.CDK_DEFAULT_ACCOUNT }}
+  CALLBACK: ${{ vars.DEV_API_URL }}
+
+jobs:
+  redeploy:
+    runs-on: ubuntu-latest
+    # A ceiling, not a target. Successful redeploys run 0.3-2.2 minutes. The job
+    # had no ceiling, so a stalled step could have run for six hours. [P3.13]
+    timeout-minutes: 20
+    steps:
+      - name: Derive slug
+        id: slug
+        env:
+          SLUG_INPUT: ${{ inputs.slug }}
+        run: |
+          set -euo pipefail
+          slug="${SLUG_INPUT#ws/}"          # tolerate a pasted ws/ prefix
+          echo "$slug" | grep -Eq '^[0-9a-z]{8}$' || { echo "::error::bad slug: '$slug'"; exit 1; }
+          echo "slug=$slug" >> "$GITHUB_OUTPUT"
+          echo "WS_DB_NAME=app_ws_$slug" >> "$GITHUB_ENV"
+
+      # Resolve the workspace; skip unless active (provision owns the 1st build).
+      - name: Resolve workspace
+        id: ws
+        env:
+          SECRET: ${{ secrets.PROVISION_CALLBACK_SECRET }}
+          SLUG: ${{ steps.slug.outputs.slug }}
+        run: |
+          set -euo pipefail
+          body="$(curl -fsS "$CALLBACK/workspaces/by-slug/$SLUG" -H "X-Provision-Secret: $SECRET" || echo '')"
+          if [ -z "$body" ]; then echo "active=false" >> "$GITHUB_OUTPUT"; echo "No workspace for $SLUG; skipping."; exit 0; fi
+          state="$(echo "$body" | jq -r '.state')"
+          id="$(echo "$body" | jq -r '.workspace_id')"
+          echo "id=$id" >> "$GITHUB_OUTPUT"
+          if [ "$state" != "active" ]; then echo "active=false" >> "$GITHUB_OUTPUT"; echo "State=$state; skipping."; exit 0; fi
+          echo "active=true" >> "$GITHUB_OUTPUT"
+
+      # The workflow DEFINITION comes from main (that is the point of the dispatch);
+      # the CODE it builds must come from the workspace branch. Do not conflate them.
+      - uses: actions/checkout@v6
+        if: steps.ws.outputs.active == 'true'
+        with:
+          ref: ws/${{ steps.slug.outputs.slug }}
+
+      - name: Deploy-started callback
+        if: steps.ws.outputs.active == 'true'
+        env:
+          SECRET: ${{ secrets.PROVISION_CALLBACK_SECRET }}
+        run: |
+          curl -fsS -X POST "$CALLBACK/workspaces/${{ steps.ws.outputs.id }}/deploy-started" \
+            -H "X-Provision-Secret: $SECRET" -H 'Content-Type: application/json' \
+            -d "{\"sha\":\"${GITHUB_SHA}\"}" || true
+
+      - uses: pnpm/action-setup@v6
+        if: steps.ws.outputs.active == 'true'
+      - uses: actions/setup-node@v6
+        if: steps.ws.outputs.active == 'true'
+        with:
+          node-version: 20
+          cache: pnpm
+      - name: Install dependencies
+        if: steps.ws.outputs.active == 'true'
+        run: pnpm install --frozen-lockfile
+
+      # The SCRIPT comes from `main`, not from ws/<slug> — the same distinction
+      # the roles step below draws for its SQL [P3.11], and it matters more here
+      # than it looks. This script can append a directory to $GITHUB_PATH, so a
+      # ws-branch copy could plant its own `psql` and have the step below run it
+      # with $ADMIN_URL. The checkout above is the workspace branch, which is
+      # agent-authored. `main` is LITERAL for the reason P3.11 gives: a privilege
+      # boundary must not depend on a repository setting.
+      #
+      # No fallback, as of 2026-08-20. Until the promote in #219 this step fell
+      # back to `apt-get install postgresql-client` when `main` did not carry the
+      # script, because `main` did not yet carry it. It does now, so the branch is
+      # dead code, and dead code in a step that decides which `psql` later steps
+      # run is worth removing rather than leaving to be read as a live option.
+      # A missing file here means the trusted ref is wrong; refusing is the
+      # correct answer to that, so the check says so and exits. [P3.13]
+      - name: Ensure a PostgreSQL client
+        if: steps.ws.outputs.active == 'true'
+        timeout-minutes: 3
+        run: |
+          set -euo pipefail
+          git fetch --depth=1 origin main
+          if ! git show FETCH_HEAD:scripts/ensure-psql-client.sh > /tmp/ensure-psql-client.sh; then
+            echo "::error::main does not carry scripts/ensure-psql-client.sh. The trusted ref is wrong — see P3.13."
+            exit 1
+          fi
+          chmod +x /tmp/ensure-psql-client.sh
+          /tmp/ensure-psql-client.sh 16
+
+      # Refresh the clone's own roles and mint a new password pair [P0.4(a)].
+      # Idempotent, so it also backfills workspaces provisioned before this
+      # existed. Nothing stores these — every redeploy rotates them.
+      - name: Refresh the workspace's database roles
+        if: steps.ws.outputs.active == 'true'
+        env:
+          ADMIN_URL: ${{ secrets.DATABASE_URL_RDS_ADMIN }}
+          SLUG: ${{ steps.slug.outputs.slug }}
+        run: |
+          set -euo pipefail
+          ADMIN_BASE="${ADMIN_URL%/*}"
+          CLONE_URL="$ADMIN_BASE/$WS_DB_NAME?sslmode=require"
+          APP_PW="$(openssl rand -hex 24)"
+          MIG_PW="$(openssl rand -hex 24)"
+
+          # The SCRIPT comes from `main`, not from ws/<slug>. The checkout above
+          # is the workspace branch — agent-authored — so running its copy of this
+          # file with the admin credential would hand back the escalation this
+          # step removes. Same distinction P0.3 drew for workflow definitions,
+          # applied to the SQL they execute.
+          #
+          # `main` is LITERAL, and it used to be
+          # `github.event.repository.default_branch` [P3.11]. That expression
+          # made a privilege boundary depend on a repository setting: `main`
+          # requires a code-owner review with no bypass, `dev` requires zero
+          # approvals, and P3.9 proposes moving the default from one to the other.
+          # The trusted ref has to be named, not resolved. `packages/db/scripts/`
+          # is also a protected path now, so the review requirement is stated
+          # rather than inherited from whatever `default_branch` happens to be.
+          #
+          # The checkout above is shallow and ws-only, so origin/main is not
+          # present locally — fetch it explicitly rather than assuming.
+          git fetch --depth=1 origin main
+          git show "FETCH_HEAD:packages/db/scripts/workspace-db-roles.sql" > /tmp/ws-roles.sql
+
+          psql "$CLONE_URL" -v ON_ERROR_STOP=1 \
+            -c "SET ws.slug='$SLUG'" \
+            -c "SET ws.app_password='$APP_PW'" \
+            -c "SET ws.mig_password='$MIG_PW'" \
+            -f /tmp/ws-roles.sql
+
+          HOSTPORT="${CLONE_URL##*@}"
+          APP_URL="postgresql://ws_${SLUG}:${APP_PW}@${HOSTPORT}"
+          MIG_URL="postgresql://ws_${SLUG}_mig:${MIG_PW}@${HOSTPORT}"
+          for v in "$APP_PW" "$MIG_PW" "$APP_URL" "$MIG_URL"; do echo "::add-mask::$v"; done
+          echo "WS_APP_URL=$APP_URL" >> "$GITHUB_ENV"
+          echo "WS_MIG_URL=$MIG_URL" >> "$GITHUB_ENV"
+
+      # These migrations are agent-authored: the checkout is ws/<slug>, and
+      # packages/db/src/migrations is a path agents are meant to write. Running
+      # them as the RDS master user meant one committed `CREATE ROLE … SUPERUSER`
+      # reached every database on the instance, with no workflow edit and nothing
+      # for CI to catch. They now run as the clone's own migration role, which
+      # cannot create roles or connect anywhere else. [P0.14]
+      - name: Apply pending migrations to the clone
+        if: steps.ws.outputs.active == 'true'
+        env:
+          DATABASE_URL: ${{ env.WS_MIG_URL }}
+        run: |
+          set -euo pipefail
+          pnpm --filter @app/types build
+          pnpm --filter @app/db build
+          pnpm --filter @app/db migrate:latest
+
+      - name: Configure AWS credentials (provisioner role)
+        if: steps.ws.outputs.active == 'true'
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          aws-region: ${{ env.AWS_REGION }}
+          role-to-assume: ${{ vars.WS_PROVISIONER_ROLE_ARN }}
+
+      - name: Redeploy workspace stack
+        if: steps.ws.outputs.active == 'true'
+        env:
+          # The workspace's OWN role, not the admin credential (P0.4(a)). This is
+          # the value CDK bakes into the Lambda, where agent-authored code can read
+          # it — so it must be the least-privileged string in this workflow.
+          DATABASE_URL: ${{ env.WS_APP_URL }}
+          # READ-ONLY control-plane URL (P0.6). The workspace runs agent-authored
+          # code and must not write to the control plane. The stack REFUSES to
+          # start without this rather than falling back to the read-write URL.
+          CONTROL_DATABASE_URL_RO: ${{ secrets.CONTROL_DATABASE_URL_RO }}
+          REQUEST_ATTACHMENTS_BUCKET: ${{ vars.REQUEST_ATTACHMENTS_BUCKET }}
+          COGNITO_USER_POOL_ID: ${{ vars.COGNITO_USER_POOL_ID }}
+          COGNITO_CLIENT_ID: ${{ vars.COGNITO_CLIENT_ID }}
+          COGNITO_REGION: ${{ vars.COGNITO_REGION || vars.AWS_REGION || 'us-east-1' }}
+          SLUG: ${{ steps.slug.outputs.slug }}
+        run: |
+          set -euo pipefail
+          pnpm --filter @app/api build
+          # @app/infra imports @meraki-digital/workspace-cdk [P5.3] — build it
+          # first or @app/infra's own build can't resolve the import.
+          pnpm --filter @meraki-digital/workspace-cdk build
+          pnpm --filter @app/infra build
+          pnpm --filter @app/infra exec cdk --app "node dist/app.js" deploy \
+            "$APP_NAME-ws-$SLUG" -c workspace="$SLUG" \
+            --require-approval never --outputs-file "$GITHUB_WORKSPACE/ws-outputs.json"
+
+      - name: Rebuild + publish frontend
+        if: steps.ws.outputs.active == 'true'
+        env:
+          SLUG: ${{ steps.slug.outputs.slug }}
+        run: |
+          set -euo pipefail
+          k="$APP_NAME-ws-$SLUG"
+          api_url="$(jq -r --arg k "$k" '.[$k].ApiUrl' "$GITHUB_WORKSPACE/ws-outputs.json")"
+          bucket="$(jq -r --arg k "$k" '.[$k].FrontendBucketName' "$GITHUB_WORKSPACE/ws-outputs.json")"
+          dist="$(jq -r --arg k "$k" '.[$k].DistributionId' "$GITHUB_WORKSPACE/ws-outputs.json")"
+          VITE_API_URL="$api_url" \
+          VITE_AUTH_MODE=cognito \
+          VITE_WORKSPACE_SLUG="$SLUG" \
+          VITE_COGNITO_USER_POOL_ID="${{ vars.COGNITO_USER_POOL_ID }}" \
+          VITE_COGNITO_CLIENT_ID="${{ vars.COGNITO_CLIENT_ID }}" \
+          VITE_COGNITO_REGION="${{ vars.COGNITO_REGION || vars.AWS_REGION || 'us-east-1' }}" \
+            pnpm --filter @app/frontend build
+          aws s3 sync packages/frontend/dist "s3://$bucket" --delete
+          aws cloudfront create-invalidation --distribution-id "$dist" --paths "/*"
+
+      - name: Deploy-succeeded callback
+        if: steps.ws.outputs.active == 'true'
+        env:
+          SECRET: ${{ secrets.PROVISION_CALLBACK_SECRET }}
+        run: |
+          curl -fsS -X POST "$CALLBACK/workspaces/${{ steps.ws.outputs.id }}/deploy-succeeded" \
+            -H "X-Provision-Secret: $SECRET" -H 'Content-Type: application/json' \
+            -d "{\"sha\":\"${GITHUB_SHA}\"}"
+
+      - name: Deploy-failed callback
+        if: failure() && steps.ws.outputs.active == 'true'
+        env:
+          SECRET: ${{ secrets.PROVISION_CALLBACK_SECRET }}
+        run: |
+          curl -fsS -X POST "$CALLBACK/workspaces/${{ steps.ws.outputs.id }}/deploy-failed" \
+            -H "X-Provision-Secret: $SECRET" -H 'Content-Type: application/json' -d '{}' || true

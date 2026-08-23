@@ -1,0 +1,51 @@
+name: sweep-workspaces
+
+# The actual work behind sweep-workspaces.yml — see
+# provision-workspace.yml's header for why this split exists and
+# how `secrets`/`vars` resolve.  [P5.4]
+#
+# Auto-retirement sweeper: pokes each environment's /workspaces/sweep-lifecycle
+# endpoint so idle/promoted workspaces get scheduled for destruction and
+# past-grace ones get torn down — keeping the AWS bill bounded.
+#
+# The endpoint does the work (see the workspaces router); this just calls it
+# with the shared secret. Each env is skipped unless its URL is configured.
+# Repo config (see MANUAL_STEPS.md):
+#   vars:    DEV_API_URL, PROD_API_URL
+#   secrets: NOTIFY_SWEEP_SECRET (dev), NOTIFY_SWEEP_SECRET_PROD (prod)
+
+on:
+  workflow_call: {}
+
+permissions:
+  contents: read
+
+jobs:
+  sweep:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - env: dev
+            url: ${{ vars.DEV_API_URL }}
+            secret_name: NOTIFY_SWEEP_SECRET
+          - env: prod
+            url: ${{ vars.PROD_API_URL }}
+            secret_name: NOTIFY_SWEEP_SECRET_PROD
+    steps:
+      - name: Sweep ${{ matrix.env }}
+        env:
+          URL: ${{ matrix.url }}
+          SECRET: ${{ secrets[matrix.secret_name] }}
+        run: |
+          set -euo pipefail
+          if [ -z "$URL" ] || [ -z "$SECRET" ]; then
+            echo "${{ matrix.env }}: URL or secret unset — skipping."
+            exit 0
+          fi
+          echo "Sweeping ${{ matrix.env }} ($URL)…"
+          curl -fsS -X POST "$URL/workspaces/sweep-lifecycle" \
+            -H "X-Sweep-Secret: $SECRET" \
+            -H 'Content-Type: application/json' \
+            -d '{}'

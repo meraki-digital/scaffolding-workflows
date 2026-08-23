@@ -1,0 +1,153 @@
+name: ws-automerge
+
+# The actual work behind ws-automerge.yml — see
+# provision-workspace.yml's header for why this split exists and
+# how `secrets` resolve.  [P5.4]
+#
+# Auto-merge the agent's PR into a workspace branch (ws/**) once CI is green, so
+# the workspace redeploys with the change. Only the workspace lane auto-merges;
+# dev/prod promotions stay human-gated.
+#
+# The merge uses a PAT (secrets.WS_AUTOMERGE_TOKEN), NOT the default GITHUB_TOKEN:
+# a GITHUB_TOKEN push does not trigger other workflows, so redeploy-workspace.yml
+# would never fire. Fail-closed: does nothing unless vars.WS_AUTOMERGE_ENABLED
+# is 'true' and the token is set.
+#
+# WS_AUTOMERGE_TOKEN must be a fine-grained PAT owned by the ORG (not a personal
+# account), scoped to this repository, with exactly these five permissions:
+#
+#   Metadata        read    (mandatory)
+#   Pull requests   write   list candidates, merge
+#   Contents        write   squash-merge, --delete-branch
+#   Actions         write   dispatch redeploy-workspace
+#   Issues          write   remove the agent-coding label
+#
+# It does NOT need Commit statuses or Checks: the CI-verdict reads use
+# GITHUB_TOKEN instead. A fine-grained PAT *cannot* read check-runs — no such
+# permission is offered — so routing those reads through the PAT fails with
+# "Resource not accessible by personal access token" and no other signal.
+# The earlier version of this comment listed only Contents + Pull requests,
+# which produced a token that authenticated fine and could not do the job.
+# See MANUAL_STEPS.md.
+#
+# No inputs: this scans every open ws/** PR itself via the GitHub API rather
+# than resolving one from the triggering event, which is also what lets it
+# stay a plain `workflow_call` with nothing to pass in. The caller stub still
+# needs the real `pull_request`/`workflow_run` triggers and their
+# `github.event.*` fields for its own concurrency group — see that file.
+
+on:
+  workflow_call: {}
+
+# These govern GITHUB_TOKEN, which reads the CI verdict below. `checks` is the
+# reason this block matters: a fine-grained PAT cannot be granted check-runs
+# access — GitHub offers no such permission for PATs — so the verdict reads
+# cannot use WS_AUTOMERGE_TOKEN. See the two-token split in the merge step.
+permissions:
+  contents: read
+  pull-requests: read
+  checks: read
+  statuses: read
+
+jobs:
+  automerge:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Gate — enabled + token present
+        id: gate
+        env:
+          ENABLED: ${{ vars.WS_AUTOMERGE_ENABLED }}
+          TOKEN: ${{ secrets.WS_AUTOMERGE_TOKEN }}
+        run: |
+          if [ "$ENABLED" != "true" ] || [ -z "$TOKEN" ]; then
+            echo "ws-automerge disabled (set vars.WS_AUTOMERGE_ENABLED=true and secrets.WS_AUTOMERGE_TOKEN)."
+            echo "go=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "go=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Merge eligible workspace PRs
+        if: steps.gate.outputs.go == 'true'
+        env:
+          # Two tokens, deliberately. GH_TOKEN (the PAT) performs the WRITES —
+          # merge, dispatch, label — because a GITHUB_TOKEN action does not
+          # trigger other workflows, which would strand the redeploy dispatch.
+          # RO_TOKEN (GITHUB_TOKEN) performs the CI-verdict READS, because a
+          # fine-grained PAT cannot be granted check-runs access at all: there
+          # is no "Checks" permission in the fine-grained PAT UI. Verified
+          # 2026-08-12 — `commits/{sha}/check-runs` 403s for the PAT while
+          # `commits/{sha}/status` succeeds once "Commit statuses" is granted.
+          GH_TOKEN: ${{ secrets.WS_AUTOMERGE_TOKEN }}
+          RO_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          # The check-run this workflow publishes is named after its JOB, not the
+          # workflow. Keep in sync with the job key below if it is ever renamed.
+          SELF_CHECK_NAME: automerge
+        run: |
+          set -euo pipefail
+
+          # Candidate open PRs whose base is a ws/** branch.
+          #
+          # Deliberately event-agnostic: this scans every open ws/** PR rather
+          # than resolving one from the event payload. That is what lets the same
+          # body serve `pull_request` and `workflow_run` with no branching — a
+          # workflow_run payload has no pull_request to resolve, and mapping its
+          # head SHA back to a PR would be an extra call that can race. It also
+          # means a PR that was skipped while pending is picked up by the next CI
+          # completion for ANY workspace, which is a useful self-healing property.
+          candidates="$(gh api "repos/$REPO/pulls?state=open&per_page=100" \
+            --jq '.[] | select(.base.ref | startswith("ws/")) | {number:.number, sha:.head.sha, base:.base.ref}')"
+          if [ -z "$candidates" ]; then echo "No open ws/** PRs."; exit 0; fi
+
+          echo "$candidates" | jq -c '.' | while read -r pr; do
+            n="$(echo "$pr" | jq -r '.number')"
+            sha="$(echo "$pr" | jq -r '.sha')"
+            base="$(echo "$pr" | jq -r '.base')"
+
+            # Mergeability (poll briefly — GitHub computes it async).
+            mergeable=""
+            for _ in 1 2 3 4 5; do
+              mergeable="$(gh api "repos/$REPO/pulls/$n" --jq '.mergeable')"
+              [ "$mergeable" != "null" ] && break
+              sleep 3
+            done
+            if [ "$mergeable" = "false" ]; then echo "PR #$n not mergeable; skip."; continue; fi
+
+            # CI verdict = combined commit status + check-runs. An EMPTY combined
+            # status (total_count:0) is NOT pending (gotcha) — treat as neutral.
+            state="$(GH_TOKEN="$RO_TOKEN" gh api "repos/$REPO/commits/$sha/status" --jq '.state')"       # success|pending|failure
+            total="$(GH_TOKEN="$RO_TOKEN" gh api "repos/$REPO/commits/$sha/status" --jq '.total_count')"
+            # Exclude THIS workflow's own check-runs. The pull_request-triggered
+            # sibling of this very run appears as a check-run on the same head
+            # SHA, so counting it lets ws-automerge block itself: on 2026-08-12 a
+            # sibling that 403'd left checks_bad=1 and the workflow_run instance
+            # skipped a PR that was otherwise green. Even a healthy sibling is a
+            # race — if it is still in progress when ci completes, it counts as
+            # not-completed. Matched on name because a workflow cannot read its
+            # own check-run id. [P0.13, round 3 finding 13]
+            # `gh api --jq` takes no --arg, so pipe to jq for the parameterised filter.
+            checks_bad="$(GH_TOKEN="$RO_TOKEN" gh api "repos/$REPO/commits/$sha/check-runs" \
+              | jq --arg self "$SELF_CHECK_NAME" \
+              '[.check_runs[]
+                | select(.name != $self)
+                | select(.status!="completed" or (.conclusion|IN("success","neutral","skipped")|not))] | length')"
+
+            if { [ "$state" = "success" ] || [ "$total" = "0" ]; } && [ "$checks_bad" = "0" ]; then
+              echo "PR #$n green → merging (squash)."
+              gh pr merge "$n" --repo "$REPO" --squash --delete-branch
+
+              # redeploy-workspace no longer fires on push (P0.3), so dispatch it.
+              # --ref main is load-bearing: it runs main's definition of the workflow
+              # rather than the workspace branch's. Without it this inherits the exact
+              # problem P0.3 exists to remove.
+              gh workflow run redeploy-workspace.yml \
+                --repo "$REPO" --ref main -f slug="${base#ws/}" \
+                || echo "::warning::redeploy dispatch failed for ${base}; dispatch it manually"
+              issue="$(gh pr view "$n" --repo "$REPO" --json body --jq '.body' | grep -oiE 'Closes #[0-9]+' | grep -oE '[0-9]+' | head -1 || true)"
+              if [ -n "$issue" ]; then
+                gh issue edit "$issue" --repo "$REPO" --remove-label agent-coding || true
+              fi
+            else
+              echo "PR #$n not green yet (status=$state total=$total checks_bad=$checks_bad); skip."
+            fi
+          done

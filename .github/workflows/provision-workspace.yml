@@ -1,0 +1,321 @@
+name: provision-workspace
+
+# The actual work behind app-starter's (and every fork's) `provision-workspace.yml`
+# caller stub.  [P5.4]
+#
+# Lives HERE, in Meraki's own `scaffolding-workflows` repo, so a client fork
+# calls it by reference — `uses:
+# meraki-digital/scaffolding-workflows/.github/workflows/provision-workspace.yml@v1`
+# — instead of carrying this file's ~250 lines of provisioning logic in its
+# own repo. The fork's own copy is a thin caller stub: it owns the real
+# trigger (`workflow_dispatch`, which must live on the default branch to be
+# dispatchable at all) and nothing else. Revoking a fork's access to this
+# repo (or this repo simply ceasing to exist for them) is the entire
+# termination story — there is nothing here for them to have carried.
+#
+# Version-pinned by tag (`@v1` today), not `@main`: a change here should not
+# reach a caller until something deliberately bumps the tag it points at —
+# a one-line, reviewable diff in the caller's own repo. Same shape as
+# `@meraki-digital/workspace-cdk`'s published-version dependency  [P5.3].
+#
+# Every `${{ secrets.X }}` and `${{ vars.X }}` reference below resolves
+# against the CALLING repository, not wherever this file physically lives —
+# that is how GitHub Actions reusable workflows work, not something this file
+# arranges. The caller passes `secrets: inherit`, so no secret needs
+# redeclaring here.
+#
+# Repo config this still needs (see MANUAL_STEPS.md):
+#   secrets: DATABASE_URL_RDS_ADMIN (CREATEDB), DATABASE_URL_DEV (clone source),
+#            CONTROL_DATABASE_URL_RO, PROVISION_CALLBACK_SECRET
+#   vars:    WS_PROVISIONER_ROLE_ARN, CDK_DEFAULT_ACCOUNT, AWS_REGION,
+#            COGNITO_USER_POOL_ID, COGNITO_CLIENT_ID, COGNITO_REGION,
+#            REQUEST_ATTACHMENTS_BUCKET, APP_NAME
+
+on:
+  workflow_call:
+    inputs:
+      workspaceId:
+        description: Control-plane workspace id (uuid)
+        required: true
+        type: string
+      slug:
+        description: 8-char workspace slug
+        required: true
+        type: string
+      callbackBaseUrl:
+        description: Base URL of the dispatching backend (for callbacks)
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  id-token: write
+
+concurrency:
+  group: provision-workspace-${{ inputs.slug }}
+  cancel-in-progress: false
+
+env:
+  APP_NAME: ${{ vars.APP_NAME || 'app-starter' }}
+  AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+  CDK_DEFAULT_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+  CDK_DEFAULT_ACCOUNT: ${{ vars.CDK_DEFAULT_ACCOUNT }}
+  SLUG: ${{ inputs.slug }}
+  WORKSPACE_ID: ${{ inputs.workspaceId }}
+  CALLBACK: ${{ inputs.callbackBaseUrl }}
+  # The cloned app DB for this workspace lives on the same instance as dev.
+  WS_DB_NAME: app_ws_${{ inputs.slug }}
+
+jobs:
+  provision:
+    runs-on: ubuntu-latest
+    # A ceiling, not a target. Successful provisions run 2.3-7.9 minutes, most of
+    # it the dump/restore and the CDK stack. 20 leaves headroom for a larger dev
+    # database while still failing a stall fast; the job had no ceiling at all,
+    # so a stalled step could have run for six hours. [P3.13]
+    timeout-minutes: 20
+    steps:
+      - name: Validate slug
+        run: |
+          set -euo pipefail
+          echo "$SLUG" | grep -Eq '^[0-9a-z]{8}$' || { echo "::error::bad slug"; exit 1; }
+
+      - uses: actions/checkout@v6
+        with:
+          ref: dev
+          fetch-depth: 0
+
+      - name: Create workspace branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          git config user.name "workspace-provisioner"
+          git config user.email "provisioner@users.noreply.github.com"
+          if git ls-remote --exit-code --heads origin "ws/$SLUG" >/dev/null 2>&1; then
+            echo "Branch ws/$SLUG already exists; leaving it."
+          else
+            git checkout -b "ws/$SLUG"
+            git push origin "ws/$SLUG"
+          fi
+
+      # Normally no network I/O: the runner image already ships a PostgreSQL 16
+      # client. See scripts/ensure-psql-client.sh for the 2026-08-19 stall that
+      # retired the old `apt-get update && apt-get install` pair. The script comes
+      # from the `dev` checkout above, which is safe in the ordering this repo
+      # uses — an item lands on dev before it is promoted to the branch these
+      # definitions are dispatched from, so dev has the script before any caller
+      # asks for it. [P3.13]
+      - name: Ensure a PostgreSQL client
+        timeout-minutes: 3
+        run: scripts/ensure-psql-client.sh 16
+
+      - name: Clone the dev app database and mask it
+        env:
+          ADMIN_URL: ${{ secrets.DATABASE_URL_RDS_ADMIN }}
+          SOURCE_URL: ${{ secrets.DATABASE_URL_DEV }}
+        run: |
+          set -euo pipefail
+          ADMIN_BASE="${ADMIN_URL%/*}"
+          CLONE_URL="$ADMIN_BASE/$WS_DB_NAME?sslmode=require"
+          echo "CLONE_URL=$CLONE_URL" >> "$GITHUB_ENV"
+
+          # Retry-safe by starting from a guaranteed-empty database.
+          #
+          # The previous version did `CREATE DATABASE || echo "already exists"` and
+          # then always restored. On a retry that restored into a populated clone,
+          # so the first pre-existing object aborted psql under ON_ERROR_STOP=1
+          # (`function "fn_customer_count" already exists`, exit 3) — meaning a
+          # provision that failed anywhere after this step could NEVER be retried.
+          #
+          # Dropping first also repairs a clone left half-restored by an earlier
+          # failure, which a skip-if-exists check would silently keep.
+          #
+          # Safe because this workflow is only ever dispatched from
+          # usp_workspace_mark_provisioning (create / retry-provision), whose state
+          # guard excludes `active` — so there is never live workspace data here.
+          psql "$ADMIN_URL" -v ON_ERROR_STOP=1 -c \
+            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname='$WS_DB_NAME' AND pid<>pg_backend_pid();" \
+            >/dev/null || true
+          psql "$ADMIN_URL" -v ON_ERROR_STOP=1 -c "DROP DATABASE IF EXISTS \"$WS_DB_NAME\";"
+          psql "$ADMIN_URL" -v ON_ERROR_STOP=1 -c "CREATE DATABASE \"$WS_DB_NAME\";"
+
+          # Tables too sensitive to mask never leave the source at all. [P2.3]
+          # Read from packages/db/masking/exclude-table-data.txt so there is one
+          # list rather than a copy in this file that can drift from it — the
+          # same file packages/db/test/excludeTableDataPolicy.test.ts reads.
+          # From the `dev` checkout, for the same reason the masking rules
+          # below are: this runs with the RDS ADMIN credential.
+          exclude_flags=()
+          while IFS= read -r table; do
+            [[ -z "$table" || "$table" == \#* ]] && continue
+            exclude_flags+=("--exclude-table-data=$table")
+          done < packages/db/masking/exclude-table-data.txt
+
+          pg_dump --no-owner --no-privileges "${exclude_flags[@]}" "$SOURCE_URL" \
+            | psql -v ON_ERROR_STOP=1 "$CLONE_URL"
+
+          # ── mask the clone [P2.1] ─────────────────────────────────────────
+          #
+          # The third stage of the pipe, in the same step as the restore, because
+          # between the two there is a database full of real customer rows and
+          # nothing has masked it yet. Nothing can reach it: the workspace's own
+          # roles do not exist until the next step, and the Lambda that will use
+          # them is deployed later still.
+          #
+          # The files come from the `dev` checkout above, like
+          # ensure-psql-client.sh and for the same reason — this psql runs with
+          # the RDS ADMIN credential, so the SQL it executes must not be
+          # agent-authored. `packages/db/masking/` is a protected path, so an edit
+          # to a rule needs a human waiver on the pull request.
+          #
+          # AN EMPTY DIRECTORY IS A HARD FAILURE, not a skip. A fork that deletes
+          # these rules must not get a green provision and an unmasked clone —
+          # that is the shape of P0.29's "prints skipping and exits 0", and it is
+          # worse here because the thing silently not happening is the only reason
+          # a preview is safe to hand to an agent.
+          shopt -s nullglob
+          masks=(packages/db/masking/*.sql)
+          if [ ${#masks[@]} -eq 0 ]; then
+            echo "::error::No masking rules in packages/db/masking/ — refusing to hand an unmasked clone to a workspace. See that directory's README."
+            exit 1
+          fi
+          # Filename order, so a fork can sequence rules that depend on each
+          # other. ON_ERROR_STOP with the outer `set -e` means one bad rule fails
+          # the provision rather than leaving a half-masked clone behind.
+          for m in "${masks[@]}"; do
+            echo "Masking with $m"
+            psql "$CLONE_URL" -v ON_ERROR_STOP=1 -f "$m"
+          done
+
+      # P0.4(a). Until now the workspace Lambda's DATABASE_URL was $CLONE_URL —
+      # the RDS master credential with the database name swapped. Agent-authored
+      # code could read process.env and connect as master to every database on the
+      # instance, which made P0.6's read-only control-plane role decorative.
+      #
+      # Two roles, mirroring the migrate/runtime split in aws-deploy: ws_<slug>
+      # serves (DML, no DDL) and is the only one that reaches CDK; ws_<slug>_mig
+      # owns the clone and applies migrations. Neither can connect to another
+      # database or create roles, so hostile migration SQL is confined to this
+      # throwaway clone. See packages/db/scripts/workspace-db-roles.sql.
+      # SLUG comes from the workflow-level env (validated at the top); this
+      # workflow has no `slug` step output, unlike redeploy-workspace.
+      #
+      # The script on disk is trusted here: this job checks out the dispatch ref
+      # (the default branch) and cuts ws/<slug> from it, so nothing agent-authored
+      # exists yet. redeploy-workspace has to fetch it explicitly, because there
+      # the checkout IS the workspace branch.
+      - name: Create the workspace's database roles
+        run: |
+          set -euo pipefail
+          # hex, so the password needs no URL-encoding to survive a connection string
+          APP_PW="$(openssl rand -hex 24)"
+          MIG_PW="$(openssl rand -hex 24)"
+
+          psql "$CLONE_URL" -v ON_ERROR_STOP=1 \
+            -c "SET ws.slug='$SLUG'" \
+            -c "SET ws.app_password='$APP_PW'" \
+            -c "SET ws.mig_password='$MIG_PW'" \
+            -f packages/db/scripts/workspace-db-roles.sql
+
+          # ##*@ strips to the LAST @, so an admin password containing '@' does not
+          # split the string in the wrong place. Host names cannot contain one.
+          HOSTPORT="${CLONE_URL##*@}"
+          APP_URL="postgresql://ws_${SLUG}:${APP_PW}@${HOSTPORT}"
+          # Mask before exporting. GITHUB_ENV values are visible to every later
+          # step, and an unmasked credential in a log survives long after the
+          # workspace does.
+          echo "::add-mask::$APP_PW"
+          echo "::add-mask::$MIG_PW"
+          echo "::add-mask::$APP_URL"
+          echo "WS_APP_URL=$APP_URL" >> "$GITHUB_ENV"
+
+      - uses: pnpm/action-setup@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 20
+          cache: pnpm
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build shared packages
+        run: |
+          pnpm --filter @app/types build
+          pnpm --filter @app/db build
+          pnpm --filter @app/api build
+
+      - name: Configure AWS credentials (provisioner role)
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          aws-region: ${{ env.AWS_REGION }}
+          role-to-assume: ${{ vars.WS_PROVISIONER_ROLE_ARN }}
+
+      - name: Deploy workspace stack
+        env:
+          # The workspace's OWN role, not the admin credential (P0.4(a)).
+          DATABASE_URL: ${{ env.WS_APP_URL }}
+          # READ-ONLY control-plane URL (P0.6). The workspace runs agent-authored
+          # code and must not write to the control plane. The stack REFUSES to
+          # start without this rather than falling back to the read-write URL.
+          CONTROL_DATABASE_URL_RO: ${{ secrets.CONTROL_DATABASE_URL_RO }}
+          REQUEST_ATTACHMENTS_BUCKET: ${{ vars.REQUEST_ATTACHMENTS_BUCKET }}
+          COGNITO_USER_POOL_ID: ${{ vars.COGNITO_USER_POOL_ID }}
+          COGNITO_CLIENT_ID: ${{ vars.COGNITO_CLIENT_ID }}
+          COGNITO_REGION: ${{ vars.COGNITO_REGION || vars.AWS_REGION || 'us-east-1' }}
+        run: |
+          set -euo pipefail
+          # @app/infra imports @meraki-digital/workspace-cdk [P5.3] — build it
+          # first or @app/infra's own build can't resolve the import.
+          pnpm --filter @meraki-digital/workspace-cdk build
+          pnpm --filter @app/infra build
+          pnpm --filter @app/infra exec cdk --app "node dist/app.js" deploy \
+            "$APP_NAME-ws-$SLUG" -c workspace="$SLUG" \
+            --require-approval never \
+            --outputs-file "$GITHUB_WORKSPACE/ws-outputs.json"
+
+      - name: Read stack outputs
+        id: out
+        run: |
+          set -euo pipefail
+          f="$GITHUB_WORKSPACE/ws-outputs.json"
+          k="$APP_NAME-ws-$SLUG"
+          {
+            echo "api_url=$(jq -r --arg k "$k" '.[$k].ApiUrl' "$f")"
+            echo "site_url=$(jq -r --arg k "$k" '.[$k].SiteUrl' "$f")"
+            echo "bucket=$(jq -r --arg k "$k" '.[$k].FrontendBucketName' "$f")"
+            echo "distribution=$(jq -r --arg k "$k" '.[$k].DistributionId' "$f")"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Build + publish workspace frontend
+        env:
+          VITE_API_URL: ${{ steps.out.outputs.api_url }}
+          VITE_AUTH_MODE: cognito
+          VITE_WORKSPACE_SLUG: ${{ env.SLUG }}
+          VITE_COGNITO_USER_POOL_ID: ${{ vars.COGNITO_USER_POOL_ID }}
+          VITE_COGNITO_CLIENT_ID: ${{ vars.COGNITO_CLIENT_ID }}
+          VITE_COGNITO_REGION: ${{ vars.COGNITO_REGION || vars.AWS_REGION || 'us-east-1' }}
+        run: |
+          set -euo pipefail
+          pnpm --filter @app/frontend build
+          aws s3 sync packages/frontend/dist "s3://${{ steps.out.outputs.bucket }}" --delete
+          aws cloudfront create-invalidation --distribution-id "${{ steps.out.outputs.distribution }}" --paths "/*"
+
+      - name: Callback — provisioned
+        env:
+          SECRET: ${{ secrets.PROVISION_CALLBACK_SECRET }}
+        run: |
+          set -euo pipefail
+          curl -fsS -X POST "$CALLBACK/workspaces/$WORKSPACE_ID/provisioned" \
+            -H "X-Provision-Secret: $SECRET" \
+            -H 'Content-Type: application/json' \
+            -d "{\"branch\":\"ws/$SLUG\",\"db_name\":\"$WS_DB_NAME\",\"frontend_url\":\"${{ steps.out.outputs.site_url }}\",\"api_url\":\"${{ steps.out.outputs.api_url }}\"}"
+
+      - name: Callback — provision failed
+        if: failure()
+        env:
+          SECRET: ${{ secrets.PROVISION_CALLBACK_SECRET }}
+        run: |
+          curl -fsS -X POST "$CALLBACK/workspaces/$WORKSPACE_ID/provision-failed" \
+            -H "X-Provision-Secret: $SECRET" \
+            -H 'Content-Type: application/json' \
+            -d "{\"error\":\"Provisioning failed in GitHub Actions (run ${{ github.run_id }}).\"}" || true
