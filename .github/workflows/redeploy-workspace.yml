@@ -211,6 +211,15 @@ jobs:
           # code and must not write to the control plane. The stack REFUSES to
           # start without this rather than falling back to the read-write URL.
           CONTROL_DATABASE_URL_RO: ${{ secrets.CONTROL_DATABASE_URL_RO }}
+          # The "Resolve workspace" step above already looked this id up — it was
+          # just never threaded through to the one step that actually needs it.
+          # workspace-stack.ts (app-starter, P2.8) requires WORKSPACE_ID
+          # unconditionally, so every redeploy failed with "WORKSPACE_ID is
+          # required" until this line existed. provision-workspace.yml never had
+          # this gap because it receives workspaceId as its own input; this
+          # workflow only ever had a slug and resolved the id itself, which is
+          # exactly the step this was missing from.
+          WORKSPACE_ID: ${{ steps.ws.outputs.id }}
           REQUEST_ATTACHMENTS_BUCKET: ${{ vars.REQUEST_ATTACHMENTS_BUCKET }}
           COGNITO_USER_POOL_ID: ${{ vars.COGNITO_USER_POOL_ID }}
           COGNITO_CLIENT_ID: ${{ vars.COGNITO_CLIENT_ID }}
