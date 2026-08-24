@@ -29,9 +29,11 @@ jobs:
         include:
           - env: dev
             url: ${{ vars.DEV_API_URL }}
+            url_var: DEV_API_URL
             secret_name: NOTIFY_SWEEP_SECRET
           - env: prod
             url: ${{ vars.PROD_API_URL }}
+            url_var: PROD_API_URL
             secret_name: NOTIFY_SWEEP_SECRET_PROD
     steps:
       - name: Sweep ${{ matrix.env }}
@@ -40,8 +42,14 @@ jobs:
           SECRET: ${{ secrets[matrix.secret_name] }}
         run: |
           set -euo pipefail
+          # A `::warning::` annotation, not a plain log line — a plain line
+          # made a half-configured environment read as a green tick,
+          # indistinguishable from a fully-configured one. Still exit 0: an
+          # environment that hasn't set this up is a valid, intentional
+          # state, not a failure — the point is only that it stops being
+          # invisible.  [P0.29]
           if [ -z "$URL" ] || [ -z "$SECRET" ]; then
-            echo "${{ matrix.env }}: URL or secret unset — skipping."
+            echo "::warning::${{ matrix.env }}: vars.${{ matrix.url_var }} or secrets.${{ matrix.secret_name }} is unset — skipping the workspace sweep for this environment. Configure both if it should retire idle workspaces."
             exit 0
           fi
           echo "Sweeping ${{ matrix.env }} ($URL)…"
