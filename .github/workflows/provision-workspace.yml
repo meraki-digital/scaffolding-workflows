@@ -110,18 +110,6 @@ jobs:
         timeout-minutes: 3
         run: scripts/ensure-psql-client.sh 16
 
-      # [P5.7, app-starter] The caller's DATABASE_URL_RDS_ADMIN/DATABASE_URL_DEV
-      # now point at an instance whose security group only trusts traffic from
-      # inside its VPC — reached through a Tailscale subnet router. The caller
-      # passes `secrets: inherit`, so TAILSCALE_CI_AUTHKEY resolves here without
-      # any new wiring on this side. `tag:ci` is ephemeral: the node is removed
-      # once this job's runner disconnects.
-      - name: Connect to Tailscale
-        uses: tailscale/github-action@v4
-        with:
-          authkey: ${{ secrets.TAILSCALE_CI_AUTHKEY }}
-          tags: tag:ci
-
       - name: Clone the dev app database and mask it
         env:
           ADMIN_URL: ${{ secrets.DATABASE_URL_RDS_ADMIN }}
