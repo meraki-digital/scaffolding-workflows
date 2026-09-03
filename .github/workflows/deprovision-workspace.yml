@@ -93,15 +93,6 @@ jobs:
         timeout-minutes: 3
         run: scripts/ensure-psql-client.sh 16
 
-      # [P5.7, app-starter] Same reasoning as provision-workspace.yml — the
-      # security group now trusts only traffic through the tailnet's subnet
-      # router.
-      - name: Connect to Tailscale
-        uses: tailscale/github-action@v4
-        with:
-          authkey: ${{ secrets.TAILSCALE_CI_AUTHKEY }}
-          tags: tag:ci
-
       - name: Drop the cloned database
         env:
           ADMIN_URL: ${{ secrets.DATABASE_URL_RDS_ADMIN }}
