@@ -174,19 +174,38 @@ jobs:
           # that is the shape of P0.29's "prints skipping and exits 0", and it is
           # worse here because the thing silently not happening is the only reason
           # a preview is safe to hand to an agent.
-          shopt -s nullglob
-          masks=(packages/db/masking/*.sql)
-          if [ ${#masks[@]} -eq 0 ]; then
-            echo "::error::No masking rules in packages/db/masking/ — refusing to hand an unmasked clone to a workspace. See that directory's README."
-            exit 1
+          #
+          # MODULES [v5, scaffolding-ops#793]. A module keeps its tables in its
+          # own `mod_<id>` schema and its rules in modules/<id>/masking/. A repo
+          # that has packages/db/masking/apply.sh runs it: it runs plumbing's
+          # rules and every module's, and refuses a clone with a `mod_*`
+          # schema no rule covers. That script is in the protected path too.
+          if [ -f packages/db/masking/apply.sh ]; then
+            bash packages/db/masking/apply.sh "$CLONE_URL"
+          else
+            # A repo from before module masking: the old glob, and the same
+            # refusal for module tables, which nothing in this repo masks.
+            shopt -s nullglob
+            masks=(packages/db/masking/*.sql)
+            if [ ${#masks[@]} -eq 0 ]; then
+              echo "::error::No masking rules in packages/db/masking/ — refusing to hand an unmasked clone to a workspace. See that directory's README."
+              exit 1
+            fi
+            # Filename order, so a fork can sequence rules that depend on each
+            # other. ON_ERROR_STOP with the outer `set -e` means one bad rule fails
+            # the provision rather than leaving a half-masked clone behind.
+            for m in "${masks[@]}"; do
+              echo "Masking with $m"
+              psql "$CLONE_URL" -v ON_ERROR_STOP=1 -f "$m"
+            done
+            unmasked="$(psql "$CLONE_URL" -v ON_ERROR_STOP=1 -tA -c \
+              "SELECT string_agg(DISTINCT table_schema, ' ') FROM information_schema.tables
+                WHERE table_schema ~ '^mod_' AND table_type = 'BASE TABLE'")"
+            if [ -n "$unmasked" ]; then
+              echo "::error::No masking rules cover $unmasked. This repo predates module masking: take the template update that adds packages/db/masking/apply.sh."
+              exit 1
+            fi
           fi
-          # Filename order, so a fork can sequence rules that depend on each
-          # other. ON_ERROR_STOP with the outer `set -e` means one bad rule fails
-          # the provision rather than leaving a half-masked clone behind.
-          for m in "${masks[@]}"; do
-            echo "Masking with $m"
-            psql "$CLONE_URL" -v ON_ERROR_STOP=1 -f "$m"
-          done
 
       # P0.4(a). Until now the workspace Lambda's DATABASE_URL was $CLONE_URL —
       # the RDS master credential with the database name swapped. Agent-authored
